@@ -5,14 +5,10 @@ import time
 
 import numpy as np
 import torch
-from auto_gptq import AutoGPTQForCausalLM
-from auto_gptq.modeling._base import BaseGPTQForCausalLM
-from auto_gptq.nn_modules.qlinear.qlinear_cuda import QuantLinear as CudaQuantLinear
-from auto_gptq.nn_modules.qlinear.qlinear_cuda_old import QuantLinear as CudaOldQuantLinear
-from auto_gptq.nn_modules.qlinear.qlinear_exllama import QuantLinear as ExllamaQuantLinear
-from auto_gptq.nn_modules.qlinear.qlinear_exllamav2 import QuantLinear as ExllamaV2QuantLinear
-from auto_gptq.nn_modules.qlinear.qlinear_marlin import QuantLinear as MarlinQuantLinear
-from auto_gptq.utils import Perplexity
+from gptqmodel import GPTQModel
+from gptqmodel.nn_modules.qlinear.qlinear_exllamav2 import ExllamaV2QuantLinear
+from gptqmodel.nn_modules.qlinear.qlinear_marlin import MarlinQuantLinear
+from gptqmodel.utils import Perplexity
 from memory_tracker import MemoryTracker
 from tqdm import tqdm
 from transformers import (
@@ -93,20 +89,9 @@ def get_parser():
         help="Use the parameter ranges for (batch_size, prompt_length, new_tokens) defined in the .py file instead of the CLI ones.",
     )
     parser.add_argument(
-        "--use-exllama",
-        action="store_true",
-        help="Use Exllama kernel, to rather use the AutoGPTQ CUDA (act-order case) or CUDA-old (no act-order case) kernels.",
-    )
-    parser.add_argument(
         "--use-marlin",
         action="store_true",
         help="Use Marlin kernel.",
-    )
-    parser.add_argument(
-        "--exllama-version",
-        type=int,
-        default=2,
-        help="Use Exllamav2 kernel. Set 1 in order to use exllama kernel",
     )
     parser.add_argument(
         "--generate",
@@ -144,10 +129,7 @@ def timing_cuda(
         start_event.record()
 
         if is_decoder:
-            if isinstance(model, BaseGPTQForCausalLM):
-                _ = model.model.generate(input_ids, attention_mask=masks, generation_config=generation_config)
-            else:
-                _ = model.generate(input_ids, attention_mask=masks, generation_config=generation_config)
+            _ = model.generate(input_ids, attention_mask=masks, generation_config=generation_config)
         else:
             _ = model(input_ids, masks)
         end_event.record()
@@ -180,10 +162,7 @@ def warmup(
             eos_token_id=None,  # This is required for min_new_tokens to actually have an effect.
         )
         model.generation_config.eos_token_id = None  # greedy_search falls back on this eos_token_id that we need to set to None as well for min_new_tokens to have an effect.
-        if isinstance(model, BaseGPTQForCausalLM):
-            res = model.model.generate(input_ids, attention_mask=masks, generation_config=gen_config)
-        else:
-            res = model.generate(input_ids, attention_mask=masks, generation_config=gen_config)
+        res = model.generate(input_ids, attention_mask=masks, generation_config=gen_config)
 
         assert res.shape[1] == new_tokens + input_ids.shape[1]
         del res
@@ -248,10 +227,7 @@ def benchmark_memory(
         )
 
         if is_decoder:
-            if isinstance(model, BaseGPTQForCausalLM):
-                _ = model.model.generate(input_ids, attention_mask=masks, generation_config=gen_config)
-            else:
-                _ = model.generate(input_ids, attention_mask=masks, generation_config=gen_config)
+            _ = model.generate(input_ids, attention_mask=masks, generation_config=gen_config)
 
         else:
             _ = model(input_ids, masks)
@@ -339,20 +315,14 @@ else:
 
 load_start = time.time_ns()
 if args.gptq:
-    use_exllama = args.use_exllama and args.exllama_version == 1
-    use_exllama_v2 = args.use_exllama and args.exllama_version == 2
     use_marlin = args.use_marlin
 
-    print("use_exllama:", use_exllama)
-    print("use_exllama_v2:", use_exllama_v2)
     print("use_marlin:", use_marlin)
 
-    model = AutoGPTQForCausalLM.from_quantized(
+    model = GPTQModel.from_quantized(
         args.model,
         torch_dtype=torch.float16,
         device="cuda:0",
-        disable_exllama=not use_exllama,
-        disable_exllamav2=not use_exllama_v2,
         use_marlin=use_marlin,
         inject_fused_attention=False,
         inject_fused_mlp=False,
@@ -390,21 +360,12 @@ if args.gptq:
     group_size = model.quantize_config.group_size
     bits = model.quantize_config.bits
 
-    if use_exllama:
-        kernel = "exllama"
-        raise_if_module_not_found(model, ExllamaQuantLinear, "exllama")
-    elif use_exllama_v2:
-        kernel = "exllama_v2"
-        raise_if_module_not_found(model, ExllamaV2QuantLinear, "exllamav2")
-    elif use_marlin:
+    if use_marlin:
         kernel = "marlin"
         raise_if_module_not_found(model, MarlinQuantLinear, "marlin")
-    elif act_order:
-        kernel = "cuda"
-        raise_if_module_not_found(model, CudaQuantLinear, "cuda")
     else:
-        kernel = "cuda-old"
-        raise_if_module_not_found(model, CudaOldQuantLinear, "cuda")
+        kernel = "exllama_v2"
+        raise_if_module_not_found(model, ExllamaV2QuantLinear, "exllamav2")
 
 load_time = (load_end - load_start) * 1e-9
 print(f"Model load time: {load_time:.1f} s")
