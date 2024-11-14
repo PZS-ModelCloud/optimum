@@ -59,7 +59,6 @@ class GPTQModelQuantizer(object):
         dataset: Optional[Union[List[str], str]] = None,
         group_size: int = 128,
         damp_percent: float = 0.1,
-        damp_auto_increment: float = 0.0015,
         desc_act: bool = False,
         sym: bool = True,
         true_sequential: bool = True,
@@ -69,7 +68,6 @@ class GPTQModelQuantizer(object):
         module_name_preceding_first_block: Optional[List[str]] = None,
         batch_size: int = 1,
         pad_token_id: Optional[int] = None,
-        use_triton = False,
         max_input_length: Optional[int] = None,
         cache_block_outputs: Optional[bool] = True,
         modules_in_block_to_quantize: Optional[List[List[str]]] = None,
@@ -126,7 +124,6 @@ class GPTQModelQuantizer(object):
         self.dataset = dataset
         self.group_size = group_size
         self.damp_percent = damp_percent
-        self.damp_auto_increment = damp_auto_increment
         self.desc_act = desc_act
         self.sym = sym
         self.true_sequential = true_sequential
@@ -136,7 +133,6 @@ class GPTQModelQuantizer(object):
         self.module_name_preceding_first_block = module_name_preceding_first_block
         self.batch_size = batch_size
         self.pad_token_id = pad_token_id
-        self.use_triton = use_triton
         self.max_input_length = max_input_length
         self.quant_method = QuantizationMethod.GPTQ
         self.cache_block_outputs = cache_block_outputs
@@ -145,7 +141,6 @@ class GPTQModelQuantizer(object):
         quantize_config = QuantizeConfig()
         quantize_config.group_size = self.group_size
         quantize_config.damp_percent = self.damp_percent
-        quantize_config.damp_auto_increment = self.damp_auto_increment
         quantize_config.desc_act = self.desc_act
         quantize_config.sym = self.sym
         quantize_config.true_sequential = self.true_sequential
@@ -157,7 +152,6 @@ class GPTQModelQuantizer(object):
             "dataset",
             "group_size",
             "damp_percent",
-            "damp_auto_increment",
             "desc_act",
             "sym",
             "true_sequential",
@@ -171,9 +165,6 @@ class GPTQModelQuantizer(object):
             raise ValueError("group_size must be greater than 0 or equal to -1")
         if not (0 < self.damp_percent < 1):
             raise ValueError("damp_percent must between 0 and 1.")
-
-        if self.damp_auto_increment < 0:
-            raise ValueError("damp_auto_increment must greater than 0.")
 
     def to_dict(self):
         """
@@ -547,8 +538,6 @@ class GPTQModelQuantizer(object):
                 layer_inputs = []
             torch.cuda.empty_cache()
 
-        if self.bits == 4:
-            self.use_triton = True
         # Step 4: Pack the model at the end (Replacing the layers)
         self.pack_model(model=model, quantizers=quantizers)
 
@@ -621,16 +610,12 @@ class GPTQModelQuantizer(object):
         logger.info("Model packed.")
 
     def select_quantlinear(self):
-        if self.use_triton:
-            backend = BACKEND.TRITON
-        else:
-            backend = BACKEND.EXLLAMA_V2
         QuantLinear = select_quant_linear(
             sym=self.sym,
             desc_act=self.desc_act,
             group_size=self.group_size,
             bits=self.bits,
-            backend=backend,
+            backend=BACKEND.AUTO,
             format=FORMAT.GPTQ,
         )
         return QuantLinear
