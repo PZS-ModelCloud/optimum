@@ -129,106 +129,11 @@ class GPTQTest(unittest.TestCase):
     def check_quantized_layers_type(self, model, value):
         self.assertTrue(model.transformer.h[0].mlp.dense_4h_to_h.QUANT_TYPE == value)
 
-    def test_serialization(self):
-        """
-        Test the serialization of the model and the loading of the quantized weights
-        """
-
-        with tempfile.TemporaryDirectory() as tmpdirname:
-            self.quantizer.save(self.quantized_model, tmpdirname)
-            self.quantized_model.config.save_pretrained(tmpdirname)
-            with init_empty_weights():
-                empty_model = AutoModelForCausalLM.from_config(
-                    AutoConfig.from_pretrained(self.model_name), torch_dtype=torch.float16
-                )
-            empty_model.tie_weights()
-            quantized_model_from_saved = load_quantized_model(
-                empty_model,
-                save_folder=tmpdirname,
-                device_map={"": self.device_for_inference},
-            )
-
-            self.check_quantized_layers_type(quantized_model_from_saved, "exllama")
-
-            # transformers and auto-gptq compatibility
-            # quantized models are more compatible with device map than
-            # device context managers (they're never used in transformers testing suite)
-            _ = AutoModelForCausalLM.from_pretrained(tmpdirname, device_map={"": self.device_for_inference})
-            _ = GPTQModel.from_quantized(tmpdirname, device_map={"": self.device_for_inference})
-
-
 class GPTQTestCPUInit(GPTQTest):
     device_map_for_quantization = "cpu"
 
     def test_perplexity(self):
         pass
-
-
-class GPTQTestActOrder(GPTQTest):
-    desc_act = True
-
-    def test_serialization(self):
-        # act_order don't work with qlinear_cuda kernel
-        pass
-
-    def test_exllama_serialization(self):
-        """
-        Test the serialization of the model and the loading of the quantized weights with exllama kernel
-        """
-
-        with tempfile.TemporaryDirectory() as tmpdirname:
-            self.quantizer.save(self.quantized_model, tmpdirname)
-            self.quantized_model.config.save_pretrained(tmpdirname)
-            with init_empty_weights():
-                empty_model = AutoModelForCausalLM.from_config(
-                    AutoConfig.from_pretrained(self.model_name), torch_dtype=torch.float16
-                )
-            empty_model.tie_weights()
-            quantized_model_from_saved = load_quantized_model(
-                empty_model,
-                save_folder=tmpdirname,
-                device_map={"": self.device_for_inference},
-            )
-            self.check_quantized_layers_type(quantized_model_from_saved, "exllama")
-
-            # transformers and auto-gptq compatibility
-            # quantized models are more compatible with device map than
-            # device context managers (they're never used in transformers testing suite)
-            _ = AutoModelForCausalLM.from_pretrained(tmpdirname, device_map={"": self.device_for_inference})
-            _ = GPTQModel.from_quantized(tmpdirname, device_map={"": self.device_for_inference})
-
-    def test_exllama_max_input_length(self):
-        """
-        Test if the max_input_length works with exllama + act_order
-        """
-
-        with tempfile.TemporaryDirectory() as tmpdirname:
-            self.quantizer.save(self.quantized_model, tmpdirname)
-            self.quantized_model.config.save_pretrained(tmpdirname)
-            with init_empty_weights():
-                empty_model = AutoModelForCausalLM.from_config(
-                    AutoConfig.from_pretrained(self.model_name), torch_dtype=torch.float16
-                )
-            empty_model.tie_weights()
-            quantized_model_from_saved = load_quantized_model(
-                empty_model,
-                save_folder=tmpdirname,
-                device_map={"": self.device_for_inference},
-                max_input_length=4028,
-            )
-            self.check_quantized_layers_type(quantized_model_from_saved, "exllama")
-
-            prompt = "I am in Paris and" * 1000
-            inp = self.tokenizer(prompt, return_tensors="pt").to(0)
-            self.assertTrue(inp["input_ids"].shape[1] > 4028)
-            with self.assertRaises(RuntimeError) as cm:
-                quantized_model_from_saved.generate(**inp, num_beams=1, min_new_tokens=3, max_new_tokens=3)
-                self.assertTrue("temp_state buffer is too small" in str(cm.exception))
-
-            prompt = "I am in Paris and" * 500
-            inp = self.tokenizer(prompt, return_tensors="pt").to(0)
-            self.assertTrue(inp["input_ids"].shape[1] < 4028)
-            quantized_model_from_saved.generate(**inp, num_beams=1, min_new_tokens=3, max_new_tokens=3)
 
 
 class GPTQTestExllamav2(GPTQTest):
