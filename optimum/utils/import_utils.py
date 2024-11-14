@@ -52,7 +52,7 @@ TORCH_MINIMUM_VERSION = version.parse("1.11.0")
 TRANSFORMERS_MINIMUM_VERSION = version.parse("4.25.0")
 DIFFUSERS_MINIMUM_VERSION = version.parse("0.22.0")
 AUTOGPTQ_MINIMUM_VERSION = version.parse("0.4.99")  # Allows 0.5.0.dev0
-
+GPTQMODEL_MINIMUM_VERSION = version.parse("1.2.1")
 
 # This is the minimal required version to support some ONNX Runtime features
 ORT_QUANTIZE_MINIMUM_VERSION = version.parse("1.4.0")
@@ -66,7 +66,7 @@ _onnxruntime_available = importlib.util.find_spec("onnxruntime") is not None
 _pydantic_available = _is_package_available("pydantic")
 _accelerate_available = _is_package_available("accelerate")
 _diffusers_available = _is_package_available("diffusers")
-_auto_gptq_available = _is_package_available("auto_gptq")
+_gptq_model_available = _is_package_available("gptqmodel")
 _timm_available = _is_package_available("timm")
 _sentence_transformers_available = _is_package_available("sentence_transformers")
 
@@ -130,17 +130,15 @@ def is_timm_available():
 def is_sentence_transformers_available():
     return _sentence_transformers_available
 
-
-def is_auto_gptq_available():
-    if _auto_gptq_available:
-        version_autogptq = version.parse(importlib_metadata.version("auto_gptq"))
-        if AUTOGPTQ_MINIMUM_VERSION < version_autogptq:
+def is_gptq_model_available():
+    if _gptq_model_available:
+        version_gptqmodel = version.parse(importlib_metadata.version("gptqmodel"))
+        if GPTQMODEL_MINIMUM_VERSION <= version_gptqmodel:
             return True
         else:
             raise ImportError(
-                f"Found an incompatible version of auto-gptq. Found version {version_autogptq}, but only version above {AUTOGPTQ_MINIMUM_VERSION} are supported"
+                f"Found an incompatible version of gptqmodel. Found version {version_gptqmodel}, but only version above {GPTQMODEL_MINIMUM_VERSION} are supported"
             )
-
 
 @contextmanager
 def check_if_pytorch_greater(target_version: str, message: str):

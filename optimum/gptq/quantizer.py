@@ -25,7 +25,7 @@ from transformers import AutoTokenizer
 from transformers.pytorch_utils import Conv1D
 from transformers.utils.quantization_config import QuantizationMethod
 
-from ..utils import is_accelerate_available, is_auto_gptq_available
+from ..utils import is_accelerate_available, is_gptq_model_available
 from ..utils.modeling_utils import recurse_getattr
 from .constants import GPTQ_CONFIG
 from .data import get_dataset, prepare_dataset
@@ -39,21 +39,16 @@ if is_accelerate_available():
     )
     from accelerate.hooks import remove_hook_from_module
 
-if is_auto_gptq_available():
-    from auto_gptq import exllama_set_max_input_length
-    from auto_gptq.modeling._utils import autogptq_post_init
-    from auto_gptq.quantization import GPTQ
-    from auto_gptq.utils.import_utils import dynamically_import_QuantLinear
+if is_gptq_model_available():
+    from gptqmodel import BACKEND
+    from gptqmodel.quantization import FORMAT, FORMAT_FIELD_JSON, GPTQ, QuantizeConfig
+    from gptqmodel.utils.importer import select_quant_linear
+    from gptqmodel.utils.model import convert_gptq_v1_to_v2_format, convert_gptq_v2_to_v1_format, gptqmodel_post_init
 
 logger = getLogger(__name__)
 
 
-class ExllamaVersion(int, Enum):
-    ONE = 1
-    TWO = 2
-
-
-class GPTQQuantizer(object):
+class GPTQModelQuantizer(object):
     r"""
     A simple API for GPTQ Quantization
     """
@@ -64,6 +59,7 @@ class GPTQQuantizer(object):
         dataset: Optional[Union[List[str], str]] = None,
         group_size: int = 128,
         damp_percent: float = 0.1,
+        damp_auto_increment: float = 0.0015,
         desc_act: bool = False,
         sym: bool = True,
         true_sequential: bool = True,
@@ -73,8 +69,7 @@ class GPTQQuantizer(object):
         module_name_preceding_first_block: Optional[List[str]] = None,
         batch_size: int = 1,
         pad_token_id: Optional[int] = None,
-        disable_exllama: bool = False,
-        exllama_config: Dict[str, Any] = None,
+        use_triton = False,
         max_input_length: Optional[int] = None,
         cache_block_outputs: Optional[bool] = True,
         modules_in_block_to_quantize: Optional[List[List[str]]] = None,
@@ -115,10 +110,6 @@ class GPTQQuantizer(object):
                 The batch size of the dataset
             pad_token_id (`Optional[int]`, defaults to `None`):
                 The pad token id. Needed to prepare the dataset when `batch_size` > 1.
-            disable_exllama (`bool`, defaults to `False`):
-                Whether to use exllama backend. Only works with `bits` = 4.
-            exllama_config (`Dict[str, Any]`, *optional*):
-                The exllama config. You can specify the version of the exllama kernel through the `version` key. Defaults to `{"version": 2}` if unset.
             max_input_length (`Optional[int]`, defaults to `None`):
                 The maximum input length. This is needed to initialize a buffer that depends on the maximum expected input length.
                 It is specific to the exllama backend with act-order.
@@ -135,6 +126,7 @@ class GPTQQuantizer(object):
         self.dataset = dataset
         self.group_size = group_size
         self.damp_percent = damp_percent
+        self.damp_auto_increment = damp_auto_increment
         self.desc_act = desc_act
         self.sym = sym
         self.true_sequential = true_sequential
@@ -144,18 +136,28 @@ class GPTQQuantizer(object):
         self.module_name_preceding_first_block = module_name_preceding_first_block
         self.batch_size = batch_size
         self.pad_token_id = pad_token_id
-        self.disable_exllama = disable_exllama
-        self.exllama_config = exllama_config
+        self.use_triton = use_triton
         self.max_input_length = max_input_length
         self.quant_method = QuantizationMethod.GPTQ
         self.cache_block_outputs = cache_block_outputs
         self.modules_in_block_to_quantize = modules_in_block_to_quantize
+
+        quantize_config = QuantizeConfig()
+        quantize_config.group_size = self.group_size
+        quantize_config.damp_percent = self.damp_percent
+        quantize_config.damp_auto_increment = self.damp_auto_increment
+        quantize_config.desc_act = self.desc_act
+        quantize_config.sym = self.sym
+        quantize_config.true_sequential = self.true_sequential
+        quantize_config.bits = self.bits
+        self.quantize_config = quantize_config
 
         self.serialization_keys = [
             "bits",
             "dataset",
             "group_size",
             "damp_percent",
+            "damp_auto_increment",
             "desc_act",
             "sym",
             "true_sequential",
@@ -170,17 +172,8 @@ class GPTQQuantizer(object):
         if not (0 < self.damp_percent < 1):
             raise ValueError("damp_percent must between 0 and 1.")
 
-        if self.exllama_config is None:
-            self.exllama_config = {"version": ExllamaVersion.TWO}
-        else:
-            if "version" not in self.exllama_config:
-                raise ValueError("`exllama_config` needs to have a `version` key")
-            elif self.exllama_config["version"] not in [ExllamaVersion.ONE, ExllamaVersion.TWO]:
-                version = self.exllama_config["version"]
-                raise ValueError(
-                    f"Only supported versions are in [ExllamaVersion.ONE, ExllamaVersion.TWO] - not recognized version {version}"
-                )
-        self.exllama_version = self.exllama_config["version"]
+        if self.damp_auto_increment < 0:
+            raise ValueError("damp_auto_increment must greater than 0.")
 
     def to_dict(self):
         """
@@ -229,6 +222,23 @@ class GPTQQuantizer(object):
         self._replace_by_quant_layers(model, layers_to_be_replaced)
         return model
 
+    def convert_gptq_v1_to_v2(self, model: nn.Module):
+        # compat: runtime convert checkpoint gptq(v1) to gptq_v2 format
+        logger.info(
+            f"Compatibility: converting `{FORMAT_FIELD_JSON}` from `{FORMAT.GPTQ}` to `{FORMAT.GPTQ_V2}`.")
+        model = convert_gptq_v1_to_v2_format(
+            model,
+            quantize_config=self.quantize_config,
+            qlinear_kernel=self.qlinear_kernel,
+        )
+        return model
+
+    def convert_gptq_v2_to_v1(self, model: nn.Module):
+        model = convert_gptq_v2_to_v1_format(
+            model, quantize_config=self.quantize_config, qlinear_kernel=self.qlinear_kernel
+        )
+        return model
+
     def get_no_split_module_classes(self, model):
         """
         Get the modules that should not be split across multiple devices.
@@ -253,14 +263,8 @@ class GPTQQuantizer(object):
             name (`str`, defaults to `""`):
                 To keep track of the name of the current module
         """
-        QuantLinear = dynamically_import_QuantLinear(
-            use_triton=False,
-            desc_act=self.desc_act,
-            group_size=self.group_size,
-            bits=self.bits,
-            disable_exllama=self.disable_exllama or self.exllama_version != ExllamaVersion.ONE,
-            disable_exllamav2=self.disable_exllama or self.exllama_version != ExllamaVersion.TWO,
-        )
+        QuantLinear = self.select_quantlinear()
+        self.qlinear_kernel = QuantLinear
         if isinstance(module, QuantLinear):
             return
         for attr in dir(module):
@@ -279,20 +283,16 @@ class GPTQQuantizer(object):
                     in_features = layer.weight.shape[0]
                     out_features = layer.weight.shape[1]
                 bias = layer.bias is not None
-                if not (self.desc_act) or self.group_size == -1:
-                    new_layer = QuantLinear(
-                        self.bits,
-                        self.group_size,
-                        in_features,
-                        out_features,
-                        bias,
-                        use_cuda_fp16=self.use_cuda_fp16,
-                        weight_dtype=layer.weight.dtype,
-                    )
-                else:
-                    new_layer = QuantLinear(
-                        self.bits, self.group_size, in_features, out_features, bias, weight_dtype=layer.weight.dtype
-                    )
+                new_layer = QuantLinear(
+                    self.bits,
+                    self.group_size,
+                    self.sym,
+                    self.desc_act,
+                    in_features,
+                    out_features,
+                    bias,
+                    weight_dtype=layer.weight.dtype,
+                )
                 new_layer.device = device
                 setattr(module, attr, new_layer.to(device))
         for name1, child in module.named_children():
@@ -318,8 +318,8 @@ class GPTQQuantizer(object):
             `nn.Module`: The quantized model
         """
 
-        if not is_auto_gptq_available():
-            raise RuntimeError("auto-gptq is required in order to perform quantzation : `pip install auto-gptq`")
+        if not is_gptq_model_available():
+            raise RuntimeError("gptqmodel is required in order to perform quantzation : `pip install -v gptqmodel --no-build-isolation`")
         if not torch.cuda.is_available():
             raise RuntimeError("No GPU found. A GPU is needed to quantize model.")
 
@@ -515,9 +515,12 @@ class GPTQQuantizer(object):
                     h.remove()
                 for name in subset_name_list:
                     logger.info(f"Quantizing {name} in block {i + 1}/{len(blocks)}...")
-                    scale, zero, g_idx = gptq[name].fasterquant(
+                    scale, zero, g_idx, duration, avg_loss, _ = gptq[name].fasterquant(
                         percdamp=self.damp_percent, group_size=self.group_size, actorder=self.desc_act
                     )
+                    stat = {"layer": i + 1, "module": name, "avg_loss": f"{avg_loss: .4f}",
+                            "time": f"{duration: .4f}"}
+                    logger.info(stat)
                     quantizers[f"{self.block_name_to_quantize}.{i}.{name}"] = (
                         gptq[name].quantizer,
                         scale,
@@ -545,26 +548,7 @@ class GPTQQuantizer(object):
             torch.cuda.empty_cache()
 
         if self.bits == 4:
-            # device not on gpu
-            if device.type != "cuda" or (has_device_map and any(d in devices for d in ["cpu", "disk", "hpu"])):
-                if not self.disable_exllama:
-                    logger.warning(
-                        "Found modules on cpu/disk. Using Exllama/Exllamav2 backend requires all the modules to be on GPU. Setting `disable_exllama=True`"
-                    )
-                    self.disable_exllama = True
-            # act order and exllama
-            elif self.desc_act and not self.disable_exllama and self.exllama_version == ExllamaVersion.ONE:
-                logger.warning(
-                    "Using Exllama backend with act_order will reorder the weights offline, thus you will not be able to save the model with the right weights."
-                    "Setting `disable_exllama=True`. You should only use Exllama backend with act_order for inference. "
-                )
-                self.disable_exllama = True
-            elif not self.disable_exllama and self.exllama_version == ExllamaVersion.TWO:
-                logger.warning(
-                    "Using Exllamav2 backend will reorder the weights offline, thus you will not be able to save the model with the right weights."
-                    "Setting `disable_exllama=True`. You should only use Exllamav2 backend for inference. "
-                )
-                self.disable_exllama = True
+            self.use_triton = True
         # Step 4: Pack the model at the end (Replacing the layers)
         self.pack_model(model=model, quantizers=quantizers)
 
@@ -588,28 +572,20 @@ class GPTQQuantizer(object):
             model (`nn.Module`):
                 The input model
         """
-        if self.bits == 4 and not self.disable_exllama:
-            if get_device(model).type != "cuda" or (
-                hasattr(model, "hf_device_map") and any(d in model.hf_device_map for d in ["cpu", "disk", "hpu"])
+        if self.bits == 4:
+            if get_device(model) == torch.device("cpu") or (
+                    hasattr(model, "hf_device_map") and any(d in model.hf_device_map for d in ["cpu", "disk"])
             ):
-                if not self.disable_exllama:
-                    logger.warning(
-                        "Found modules on cpu/disk. Using Exllama/Exllamav2 backend requires all the modules to be on GPU. Setting `disable_exllama=True`"
-                    )
-                    self.disable_exllama = True
+                raise ValueError(
+                    "Found modules on cpu/disk. Using Exllama or Exllamav2 backend requires all the modules to be on GPU."
+                )
 
         class StoreAttr(object):
             pass
 
         model.quantize_config = StoreAttr()
         model.quantize_config.desc_act = self.desc_act
-        model = autogptq_post_init(model, use_act_order=self.desc_act)
-        if (
-            self.desc_act
-            and (not self.disable_exllama and self.exllama_version == ExllamaVersion.ONE)
-            and self.max_input_length is not None
-        ):
-            model = exllama_set_max_input_length(model, self.max_input_length)
+        model = gptqmodel_post_init(model, use_act_order=self.desc_act)
         return model
 
     def pack_model(
@@ -626,14 +602,7 @@ class GPTQQuantizer(object):
             quantizers (`Dict[str,Tuple]`):
                 A mapping of the layer name and the data needed to pack the layer
         """
-        QuantLinear = dynamically_import_QuantLinear(
-            use_triton=False,
-            desc_act=self.desc_act,
-            group_size=self.group_size,
-            bits=self.bits,
-            disable_exllama=self.disable_exllama or self.exllama_version != ExllamaVersion.ONE,
-            disable_exllamav2=self.disable_exllama or self.exllama_version != ExllamaVersion.TWO,
-        )
+        QuantLinear = self.select_quantlinear()
         logger.info("Packing model...")
         layers = get_layers(model)
         layers = {n: layers[n] for n in quantizers}
@@ -650,6 +619,21 @@ class GPTQQuantizer(object):
             qlayers[name].to(layer_device)
 
         logger.info("Model packed.")
+
+    def select_quantlinear(self):
+        if self.use_triton:
+            backend = BACKEND.TRITON
+        else:
+            backend = BACKEND.EXLLAMA_V2
+        QuantLinear = select_quant_linear(
+            sym=self.sym,
+            desc_act=self.desc_act,
+            group_size=self.group_size,
+            bits=self.bits,
+            backend=backend,
+            format=FORMAT.GPTQ,
+        )
+        return QuantLinear
 
     def save(self, model: nn.Module, save_dir: str, max_shard_size: str = "10GB", safe_serialization: bool = True):
         """
@@ -673,6 +657,8 @@ class GPTQQuantizer(object):
                 Whether to save the model using `safetensors` or the traditional PyTorch way (that uses `pickle`).
 
         """
+        model = self.convert_gptq_v2_to_v1(model)
+
         os.makedirs(save_dir, exist_ok=True)
         model.save_pretrained(save_dir, max_shard_size=max_shard_size, safe_serialization=safe_serialization)
         with open(os.path.join(save_dir, GPTQ_CONFIG), "w", encoding="utf-8") as f:
@@ -690,8 +676,6 @@ def load_quantized_model(
     offload_folder: Optional[str] = None,
     offload_buffers: Optional[str] = None,
     offload_state_dict: bool = False,
-    disable_exllama: bool = False,
-    exllama_config: Optional[Dict[str, Any]] = None,
     max_input_length: Optional[int] = None,
 ):
     """
@@ -725,10 +709,6 @@ def load_quantized_model(
             If `True`, will temporarily offload the CPU state dict on the hard drive to avoid getting out of CPU RAM if
             the weight of the CPU state dict + the biggest shard does not fit. Will default to `True` if the device map
             picked contains `"disk"` values.
-        disable_exllama (`Optional[bool]`, defaults to `None`):
-            Whether to use exllama backend. Only works with `bits` = 4.
-        exllama_config (`Optional[Dict[str, Any]]`, defaults to `None`):
-            The exllama config. You can specify the version of the exllama kernel through the `version` key. Defaults to `{"version": 2}` if unset.
         max_input_length (`Optional[int]`, defaults to `None`):
             The maximum input length. This is needed to initialize a buffer that depends on the maximum expected input length.
             It is specific to the exllama backend with act-order.
@@ -738,8 +718,8 @@ def load_quantized_model(
     """
     if not torch.cuda.is_available():
         raise RuntimeError("No GPU found. A GPU is needed to run quantized model.")
-    if not is_auto_gptq_available():
-        raise RuntimeError("auto-gptq is required in order to load quantized weights : `pip install auto-gptq`")
+    if not is_gptq_model_available():
+        raise RuntimeError("gptqmodel is required in order to perform quantzation : `pip install -v gptqmodel --no-build-isolation`")
     if not is_accelerate_available():
         raise RuntimeError(
             "You need to install accelerate in order to load and dispatch weights to"
@@ -748,17 +728,6 @@ def load_quantized_model(
     if device_map is None:
         device_map = {"": torch.cuda.current_device()}
         logger.info("The device_map was not initialized." "Setting device_map to `{'':torch.cuda.current_device()}`.")
-
-    if exllama_config is None:
-        exllama_config = {"version": ExllamaVersion.TWO}
-    else:
-        if "version" not in exllama_config:
-            raise ValueError("`exllama_config` needs to have a `version` key")
-        elif exllama_config["version"] not in [ExllamaVersion.ONE, ExllamaVersion.TWO]:
-            version = exllama_config["version"]
-            raise ValueError(
-                f"Only supported versions are in [ExllamaVersion.ONE, ExllamaVersion.TWO] - not recognized version {version}"
-            )
 
     # this branch will check if model is from huggingface
     try:
@@ -771,10 +740,7 @@ def load_quantized_model(
         raise ValueError(
             f"Failed to load quantization config from {save_folder} (lookup for traceback): {err}\nTip: If the save directory is saved from a transformers.PreTrainedModel, make sure that `config.json` contains a 'quantization_config' key."
         ) from err
-    quantizer = GPTQQuantizer.from_dict(quantize_config_dict)
-    quantizer.disable_exllama = disable_exllama
-    quantizer.exllama_config = exllama_config
-    quantizer.exllama_version = quantizer.exllama_config["version"]
+    quantizer = GPTQModelQuantizer.from_dict(quantize_config_dict)
     quantizer.max_input_length = max_input_length
 
     model = quantizer.convert_model(model)
